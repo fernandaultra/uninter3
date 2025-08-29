@@ -1,16 +1,17 @@
 import os
 import io
+import csv
 import json
 import traceback
 from typing import Tuple, List
 
 import pandas as pd
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, Response, send_file
 import gspread
 from google.oauth2.service_account import Credentials
 
 # =========================
-# CONFIG PADRÃO (ajuste se quiser)
+# CONFIG PADRÃO
 # =========================
 DEFAULT_SPREADSHEET_ID = "1NPP1K8335plGHaJtSUM3ag6FZkbONEgGxISONXW3KDQ"
 DEFAULT_SHEET_TITLE = "Cursos Gratuitos"
@@ -21,9 +22,9 @@ GSHEETS_SCOPES = [
     "https://www.googleapis.com/auth/drive",
 ]
 
-# (Opcional) Proteção simples por API key nas rotas de escrita:
-# Defina no Render uma env: API_KEY=segredo-123
-REQUIRE_API_KEY = False  # mude para True se quiser exigir X-API-KEY
+# (Opcional) Proteção por API key na rota de escrita
+# Defina no Render: API_KEY=segredo-123 e mude para True abaixo:
+REQUIRE_API_KEY = False
 API_KEY_ENV_NAME = "API_KEY"
 
 
@@ -38,7 +39,14 @@ def create_app() -> Flask:
     def index():
         return jsonify({
             "message": "OK",
-            "endpoints": ["/", "/health", "/sheets/preview", "/send-to-sheets"]
+            "endpoints": [
+                "/",
+                "/health",
+                "/sheets/preview",
+                "/sheets/export.csv",
+                "/sheets/export.xlsx",
+                "/send-to-sheets"
+            ]
         })
 
     @app.get("/health")
@@ -49,13 +57,8 @@ def create_app() -> Flask:
     # Helpers
     # =========================
     def _require_api_key_if_enabled() -> Tuple[bool, str]:
-        """
-        Se REQUIRE_API_KEY=True, exige header X-API-KEY igual à env API_KEY.
-        Retorna (ok, motivo_erro_ou_vazio).
-        """
         if not REQUIRE_API_KEY:
             return True, ""
-
         expected = os.getenv(API_KEY_ENV_NAME, "").strip()
         provided = request.headers.get("X-API-KEY", "").strip()
         if not expected:
@@ -65,33 +68,20 @@ def create_app() -> Flask:
         return True, ""
 
     def _load_service_account_info() -> dict:
-        """
-        Lê GOOGLE_CREDENTIALS_JSON de duas formas:
-        - Secret File (valor da env é um path existente)
-        - JSON inline (valor é o próprio JSON)
-        """
         raw = os.getenv("GOOGLE_CREDENTIALS_JSON")
         if not raw:
             raise RuntimeError("Falta a env GOOGLE_CREDENTIALS_JSON no Render.")
-
-        if os.path.exists(raw):
-            # Secret File → raw é caminho de arquivo
+        if os.path.exists(raw):  # Secret File → path
             with open(raw, "r", encoding="utf-8") as f:
                 content = f.read()
-        else:
-            # JSON inline
+        else:  # JSON inline
             content = raw
-
         try:
-            info = json.loads(content)
+            return json.loads(content)
         except Exception as e:
             raise RuntimeError(f"GOOGLE_CREDENTIALS_JSON inválido (não é JSON). Detalhe: {e}")
-        return info
 
     def _gspread_client():
-        """
-        Cria cliente gspread autorizado com as credenciais lidas.
-        """
         info = _load_service_account_info()
         credentials = Credentials.from_service_account_info(info, scopes=GSHEETS_SCOPES)
         return gspread.authorize(credentials)
@@ -102,13 +92,22 @@ def create_app() -> Flask:
     @app.get("/sheets/preview")
     def sheets_preview():
         """
-        Lê as primeiras 10 linhas da aba solicitada.
-        Query params:
-          - spreadsheet_id (opcional) => default DEFAULT_SPREADSHEET_ID
-          - sheet (opcional)          => default DEFAULT_SHEET_TITLE
+        Lê linhas da planilha com paginação.
+        Params:
+          - spreadsheet_id (opcional)
+          - sheet (opcional)
+          - limit (opcional, padrão 10, máx 1000)
+          - offset (opcional, padrão 0)
         """
         sheet_title = request.args.get("sheet", DEFAULT_SHEET_TITLE)
         spreadsheet_id = request.args.get("spreadsheet_id", DEFAULT_SPREADSHEET_ID)
+        try:
+            limit = int(request.args.get("limit", 10))
+            offset = int(request.args.get("offset", 0))
+            limit = max(0, min(limit, 1000))
+            offset = max(0, offset)
+        except ValueError:
+            return jsonify({"error": "Parâmetros limit/offset devem ser inteiros."}), 400
 
         try:
             client = _gspread_client()
@@ -116,16 +115,19 @@ def create_app() -> Flask:
             ws = sh.worksheet(sheet_title)
             data: List[List[str]] = ws.get_all_values()
             header = data[0] if data else []
-            rows = data[1:11] if len(data) > 1 else []
-            out = [dict(zip(header, r)) for r in rows] if header else rows
-            return jsonify({"sheet": sheet_title, "preview": out}), 200
+            body = data[1:] if len(data) > 1 else []
+            sliced = body[offset: offset + limit] if limit > 0 else body[offset:]
+            out = [dict(zip(header, r)) for r in sliced] if header else sliced
+            return jsonify({
+                "sheet": sheet_title,
+                "total_rows": len(body),
+                "limit": limit,
+                "offset": offset,
+                "preview": out
+            }), 200
 
         except gspread.exceptions.APIError as e:
-            # Erros da API do Google (inclui auth/escopos/perm)
-            return jsonify({
-                "error": "Falha ao ler Google Sheets (APIError)",
-                "detail": str(e)
-            }), 500
+            return jsonify({"error": "Falha ao ler Google Sheets (APIError)", "detail": str(e)}), 500
         except Exception as e:
             return jsonify({
                 "error": "Falha ao ler Google Sheets",
@@ -133,16 +135,67 @@ def create_app() -> Flask:
                 "trace": traceback.format_exc()
             }), 500
 
+    @app.get("/sheets/export.csv")
+    def sheets_export_csv():
+        sheet_title = request.args.get("sheet", DEFAULT_SHEET_TITLE)
+        spreadsheet_id = request.args.get("spreadsheet_id", DEFAULT_SPREADSHEET_ID)
+        try:
+            client = _gspread_client()
+            sh = client.open_by_key(spreadsheet_id)
+            ws = sh.worksheet(sheet_title)
+            data = ws.get_all_values()
+            if not data:
+                return Response("", mimetype="text/csv")
+
+            output = io.StringIO()
+            writer = csv.writer(output, lineterminator="\n")
+            for row in data:
+                writer.writerow(row)
+            output.seek(0)
+            return Response(
+                output.read(),
+                mimetype="text/csv",
+                headers={"Content-Disposition": f'attachment; filename="{sheet_title}.csv"'}
+            )
+        except Exception as e:
+            return jsonify({"error": f"Falha ao exportar CSV: {e}"}), 500
+
+    @app.get("/sheets/export.xlsx")
+    def sheets_export_xlsx():
+        sheet_title = request.args.get("sheet", DEFAULT_SHEET_TITLE)
+        spreadsheet_id = request.args.get("spreadsheet_id", DEFAULT_SPREADSHEET_ID)
+        try:
+            client = _gspread_client()
+            sh = client.open_by_key(spreadsheet_id)
+            ws = sh.worksheet(sheet_title)
+            data = ws.get_all_values()
+            df = pd.DataFrame(data[1:], columns=data[0]) if data else pd.DataFrame()
+
+            buf = io.BytesIO()
+            with pd.ExcelWriter(buf, engine="openpyxl") as writer:
+                df.to_excel(writer, index=False, sheet_name=sheet_title)
+            buf.seek(0)
+            return send_file(
+                buf,
+                as_attachment=True,
+                download_name=f"{sheet_title}.xlsx",
+                mimetype="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+        except Exception as e:
+            return jsonify({"error": f"Falha ao exportar XLSX: {e}"}), 500
+
     @app.post("/send-to-sheets")
     def send_to_sheets():
         """
-        Envie multipart/form-data com key 'file' apontando para um .xlsx
-        Ex.: curl -X POST '.../send-to-sheets?sheet=MinhaAba' -F "file=@/caminho/arquivo.xlsx"
-        Query params:
-          - spreadsheet_id (opcional) => default DEFAULT_SPREADSHEET_ID
-          - sheet (opcional)          => default DEFAULT_SHEET_TITLE
+        Upload de Excel (.xlsx) e escrita na aba.
+        Params (query):
+          - spreadsheet_id (opcional)
+          - sheet (opcional)
+        Body (multipart/form-data):
+          - file = arquivo .xlsx
+        Header opcional (se habilitar API key):
+          - X-API-KEY: <valor>
         """
-        # (Opcional) checagem de API Key
         ok, reason = _require_api_key_if_enabled()
         if not ok:
             return jsonify({"error": reason}), 401
@@ -157,11 +210,9 @@ def create_app() -> Flask:
         content = file.read()
 
         try:
-            # pandas precisa do openpyxl para .xlsx
-            # (garanta openpyxl~=3.1.5 no requirements.txt)
-            df = pd.read_excel(io.BytesIO(content))
+            df = pd.read_excel(io.BytesIO(content))  # requer openpyxl
         except Exception as e:
-            return jsonify({"error": f"Falha ao ler Excel", "detail": str(e)}), 400
+            return jsonify({"error": "Falha ao ler Excel", "detail": str(e)}), 400
 
         try:
             client = _gspread_client()
@@ -183,10 +234,7 @@ def create_app() -> Flask:
             return jsonify({"status": "ok", "rows": int(rows), "sheet": sheet_title}), 200
 
         except gspread.exceptions.APIError as e:
-            return jsonify({
-                "error": "Falha ao escrever no Google Sheets (APIError)",
-                "detail": str(e)
-            }), 500
+            return jsonify({"error": "Falha ao escrever no Google Sheets (APIError)", "detail": str(e)}), 500
         except Exception as e:
             return jsonify({
                 "error": "Falha ao escrever no Google Sheets",
